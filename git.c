@@ -744,7 +744,11 @@ static void strip_extension(struct strvec *args)
 #define strip_extension(cmd)
 #endif
 
+#ifdef GIT_IOS_EMBED
+static int handle_builtin(struct strvec *args, int *exit_code)
+#else
 static void handle_builtin(struct strvec *args)
+#endif
 {
 	const char *cmd;
 	struct cmd_struct *builtin;
@@ -779,11 +783,23 @@ static void handle_builtin(struct strvec *args)
 		ret = run_builtin(builtin, args->nr, argv_copy, the_repository);
 		strvec_clear(args);
 		free(argv_copy);
+#ifdef GIT_IOS_EMBED
+		*exit_code = ret;
+		return 1;
+#else
 		exit(ret);
+#endif
 	}
+#ifdef GIT_IOS_EMBED
+	return 0;
+#endif
 }
 
+#ifdef GIT_IOS_EMBED
+static int execv_dashed_external(const char **argv, int *exit_code)
+#else
 static void execv_dashed_external(const char **argv)
+#endif
 {
 	struct child_process cmd = CHILD_PROCESS_INIT;
 	int status;
@@ -820,10 +836,24 @@ static void execv_dashed_external(const char **argv)
 	 * generic string as our trace2 command verb to indicate that we
 	 * launched a dashed command.
 	 */
-	if (status >= 0)
+	if (status >= 0) {
+#ifdef GIT_IOS_EMBED
+		*exit_code = status;
+		return 1;
+#else
 		exit(status);
-	else if (errno != ENOENT)
+#endif
+	} else if (errno != ENOENT) {
+#ifdef GIT_IOS_EMBED
+		*exit_code = 128;
+		return 1;
+#else
 		exit(128);
+#endif
+	}
+#ifdef GIT_IOS_EMBED
+	return 0;
+#endif
 }
 
 static int is_deprecated_command(const char *cmd)
@@ -832,7 +862,11 @@ static int is_deprecated_command(const char *cmd)
 	return builtin && (builtin->option & DEPRECATED);
 }
 
+#ifdef GIT_IOS_EMBED
+static int run_argv(struct strvec *args, int *exit_code)
+#else
 static int run_argv(struct strvec *args)
+#endif
 {
 	int done_alias = 0;
 	struct string_list expanded_aliases = STRING_LIST_INIT_DUP;
@@ -858,8 +892,16 @@ static int run_argv(struct strvec *args)
 		 * where it is safe to do, we can avoid spawning a new
 		 * process.
 		 */
-		if (!done_alias)
+		if (!done_alias) {
+#ifdef GIT_IOS_EMBED
+			if (handle_builtin(args, exit_code)) {
+				string_list_clear(&expanded_aliases, 0);
+				return done_alias;
+			}
+#else
 			handle_builtin(args);
+#endif
+		}
 		else if (get_builtin(args->v[0])) {
 			struct child_process cmd = CHILD_PROCESS_INIT;
 			int err;
@@ -890,13 +932,27 @@ static int run_argv(struct strvec *args)
 			cmd.wait_after_clean = 1;
 			cmd.trace2_child_class = "git_alias";
 			err = run_command(&cmd);
-			if (err >= 0 || errno != ENOENT)
+			if (err >= 0 || errno != ENOENT) {
+#ifdef GIT_IOS_EMBED
+				*exit_code = err;
+				string_list_clear(&expanded_aliases, 0);
+				return done_alias;
+#else
 				exit(err);
+#endif
+			}
 			die("could not execute builtin %s", args->v[0]);
 		}
 
 		/* .. then try the external ones */
+#ifdef GIT_IOS_EMBED
+		if (execv_dashed_external(args->v, exit_code)) {
+			string_list_clear(&expanded_aliases, 0);
+			return done_alias;
+		}
+#else
 		execv_dashed_external(args->v);
+#endif
 
 		/*
 		 * It could be an alias -- this works around the insanity
@@ -943,7 +999,17 @@ int cmd_main(int argc, const char **argv)
 	if (skip_prefix(cmd, "git-", &cmd)) {
 		strvec_push(&args, cmd);
 		strvec_pushv(&args, argv + 1);
+#ifdef GIT_IOS_EMBED
+		{
+			int exit_code = 1;
+			if (handle_builtin(&args, &exit_code)) {
+				strvec_clear(&args);
+				return exit_code;
+			}
+		}
+#else
 		handle_builtin(&args);
+#endif
 		strvec_clear(&args);
 		die(_("cannot handle %s as a builtin"), cmd);
 	}
@@ -959,7 +1025,11 @@ int cmd_main(int argc, const char **argv)
 		printf(_("usage: %s\n\n"), git_usage_string);
 		list_common_cmds_help();
 		printf("\n%s\n", _(git_more_info_string));
+#ifdef GIT_IOS_EMBED
+		return 1;
+#else
 		exit(1);
+#endif
 	}
 
 	if (!strcmp("--version", argv[0]) || !strcmp("-v", argv[0]))
@@ -981,7 +1051,16 @@ int cmd_main(int argc, const char **argv)
 		strvec_push(&args, argv[i]);
 
 	while (1) {
+#ifdef GIT_IOS_EMBED
+		int exit_code = -1;
+		int was_alias = run_argv(&args, &exit_code);
+		if (exit_code >= 0) {
+			strvec_clear(&args);
+			return exit_code;
+		}
+#else
 		int was_alias = run_argv(&args);
+#endif
 		if (errno != ENOENT)
 			break;
 		if (was_alias) {
@@ -989,7 +1068,11 @@ int cmd_main(int argc, const char **argv)
 					  "'%s' is not a git command\n"),
 				cmd, args.v[0]);
 			strvec_clear(&args);
+#ifdef GIT_IOS_EMBED
+			return 1;
+#else
 			exit(1);
+#endif
 		}
 		if (!done_help) {
 			char *assumed = help_unknown_cmd(cmd);
