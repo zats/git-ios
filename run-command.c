@@ -18,6 +18,9 @@
 #include "config.h"
 #include "packfile.h"
 #include "compat/nonblock.h"
+#ifdef GIT_IOS_EMBED
+#include <dlfcn.h>
+#endif
 
 void child_process_init(struct child_process *child)
 {
@@ -122,6 +125,247 @@ static void clear_child_for_cleanup(pid_t pid)
 		}
 	}
 }
+
+#ifdef GIT_IOS_EMBED
+typedef int (*git_ios_embedded_main_fn)(int, const char **);
+
+struct git_ios_embedded_child {
+	struct child_process *cmd;
+	pthread_t thread;
+	struct git_ios_embedded_child *next;
+};
+
+struct git_ios_embedded_thread_args {
+	git_ios_embedded_main_fn main_fn;
+	int argc;
+	const char **argv;
+	int stdin_fd;
+	int stdout_fd;
+	int stderr_fd;
+};
+
+static struct git_ios_embedded_child *git_ios_embedded_children;
+static pthread_mutex_t git_ios_embedded_children_mutex = PTHREAD_MUTEX_INITIALIZER;
+static const pid_t git_ios_embedded_child_pid = (pid_t)-2;
+
+static void *git_ios_gitremote_handle;
+
+static void *git_ios_open_gitremote_framework(void)
+{
+	Dl_info info;
+	const char *image_path;
+	const char *framework_component;
+	size_t prefix_len;
+	struct strbuf path = STRBUF_INIT;
+	void *handle;
+
+	if (git_ios_gitremote_handle)
+		return git_ios_gitremote_handle;
+
+	if (!dladdr((void *)git_ios_open_gitremote_framework, &info) || !info.dli_fname)
+		return NULL;
+
+	image_path = info.dli_fname;
+	framework_component = strstr(image_path, "/git.framework/");
+	if (!framework_component)
+		return NULL;
+
+	prefix_len = framework_component - image_path;
+	strbuf_add(&path, image_path, prefix_len);
+	strbuf_addstr(&path, "/gitremote.framework/gitremote");
+	handle = dlopen(path.buf, RTLD_LAZY | RTLD_LOCAL);
+	strbuf_release(&path);
+	if (!handle)
+		return NULL;
+	git_ios_gitremote_handle = handle;
+	return git_ios_gitremote_handle;
+}
+
+static git_ios_embedded_main_fn git_ios_lookup_embedded_main(const char *cmd)
+{
+	const char *symbol = NULL;
+	void *handle;
+
+	if (!strcmp(cmd, "remote-http") || !strcmp(cmd, "remote-ftp"))
+		symbol = "git_remote_http_main";
+	else if (!strcmp(cmd, "remote-https") || !strcmp(cmd, "remote-ftps"))
+		symbol = "git_remote_https_main";
+	else
+		return NULL;
+
+	handle = git_ios_open_gitremote_framework();
+	if (!handle)
+		return NULL;
+	return (git_ios_embedded_main_fn)dlsym(handle, symbol);
+}
+
+static void git_ios_register_embedded_child(struct child_process *cmd, pthread_t thread)
+{
+	struct git_ios_embedded_child *child = xmalloc(sizeof(*child));
+	child->cmd = cmd;
+	child->thread = thread;
+	pthread_mutex_lock(&git_ios_embedded_children_mutex);
+	child->next = git_ios_embedded_children;
+	git_ios_embedded_children = child;
+	pthread_mutex_unlock(&git_ios_embedded_children_mutex);
+}
+
+static struct git_ios_embedded_child *git_ios_take_embedded_child(struct child_process *cmd)
+{
+	struct git_ios_embedded_child **pp;
+	struct git_ios_embedded_child *child = NULL;
+
+	pthread_mutex_lock(&git_ios_embedded_children_mutex);
+	for (pp = &git_ios_embedded_children; *pp; pp = &(*pp)->next) {
+		if ((*pp)->cmd == cmd) {
+			child = *pp;
+			*pp = child->next;
+			break;
+		}
+	}
+	pthread_mutex_unlock(&git_ios_embedded_children_mutex);
+	return child;
+}
+
+static void *git_ios_run_embedded_child(void *data)
+{
+	struct git_ios_embedded_thread_args *args = data;
+	int saved_stdin = dup(0);
+	int saved_stdout = dup(1);
+	int saved_stderr = dup(2);
+	int code;
+
+	fflush(NULL);
+	if (dup2(args->stdin_fd, 0) < 0)
+		goto fail;
+	if (dup2(args->stdout_fd, 1) < 0)
+		goto fail;
+	if (args->stderr_fd >= 0 && dup2(args->stderr_fd, 2) < 0)
+		goto fail;
+
+	close(args->stdin_fd);
+	close(args->stdout_fd);
+	if (args->stderr_fd >= 0)
+		close(args->stderr_fd);
+
+	code = args->main_fn(args->argc, args->argv);
+	fflush(NULL);
+
+	dup2(saved_stdin, 0);
+	dup2(saved_stdout, 1);
+	dup2(saved_stderr, 2);
+	close(saved_stdin);
+	close(saved_stdout);
+	close(saved_stderr);
+
+	for (int i = 0; i < args->argc; i++)
+		free((char *)args->argv[i]);
+	free(args->argv);
+	free(args);
+	return (void *)(intptr_t)code;
+
+fail:
+	code = errno ? errno : 1;
+	if (args->stdin_fd >= 0)
+		close(args->stdin_fd);
+	if (args->stdout_fd >= 0)
+		close(args->stdout_fd);
+	if (args->stderr_fd >= 0)
+		close(args->stderr_fd);
+	if (saved_stdin >= 0)
+		close(saved_stdin);
+	if (saved_stdout >= 0)
+		close(saved_stdout);
+	if (saved_stderr >= 0)
+		close(saved_stderr);
+	for (int i = 0; i < args->argc; i++)
+		free((char *)args->argv[i]);
+	free(args->argv);
+	free(args);
+	return (void *)(intptr_t)code;
+}
+
+static int git_ios_start_embedded_child(struct child_process *cmd,
+					int need_in, int fdin[2],
+					int need_out, int fdout[2],
+					int need_err, int fderr[2])
+{
+	git_ios_embedded_main_fn main_fn;
+	struct git_ios_embedded_thread_args *args;
+	pthread_t thread;
+
+	if (!cmd->git_cmd || !cmd->args.nr)
+		return 0;
+
+	main_fn = git_ios_lookup_embedded_main(cmd->args.v[0]);
+	if (!main_fn)
+		return 0;
+
+	CALLOC_ARRAY(args, 1);
+	args->main_fn = main_fn;
+	args->argc = cmd->args.nr;
+	CALLOC_ARRAY(args->argv, args->argc + 1);
+	for (int i = 0; i < args->argc; i++)
+		args->argv[i] = xstrdup(cmd->args.v[i]);
+
+	if (cmd->no_stdin)
+		args->stdin_fd = open("/dev/null", O_RDONLY);
+	else if (need_in)
+		args->stdin_fd = fdin[0];
+	else if (cmd->in > 0)
+		args->stdin_fd = dup(cmd->in);
+	else
+		args->stdin_fd = dup(0);
+
+	if (cmd->no_stdout)
+		args->stdout_fd = open("/dev/null", O_WRONLY);
+	else if (cmd->stdout_to_stderr)
+		args->stdout_fd = dup(2);
+	else if (need_out)
+		args->stdout_fd = fdout[1];
+	else if (cmd->out > 1)
+		args->stdout_fd = dup(cmd->out);
+	else
+		args->stdout_fd = dup(1);
+
+	if (cmd->no_stderr)
+		args->stderr_fd = open("/dev/null", O_WRONLY);
+	else if (need_err)
+		args->stderr_fd = fderr[1];
+	else if (cmd->err > 2)
+		args->stderr_fd = dup(cmd->err);
+	else
+		args->stderr_fd = -1;
+
+	if (args->stdin_fd < 0 || args->stdout_fd < 0 || (args->stderr_fd < 0 && (cmd->no_stderr || need_err || cmd->err > 2))) {
+		errno = errno ? errno : EIO;
+		for (int i = 0; i < args->argc; i++)
+			free((char *)args->argv[i]);
+		free(args->argv);
+		free(args);
+		return -1;
+	}
+
+	if (pthread_create(&thread, NULL, git_ios_run_embedded_child, args) != 0) {
+		errno = EIO;
+		for (int i = 0; i < args->argc; i++)
+			free((char *)args->argv[i]);
+		free(args->argv);
+		if (args->stdin_fd >= 0)
+			close(args->stdin_fd);
+		if (args->stdout_fd >= 0)
+			close(args->stdout_fd);
+		if (args->stderr_fd >= 0)
+			close(args->stderr_fd);
+		free(args);
+		return -1;
+	}
+
+	cmd->pid = git_ios_embedded_child_pid;
+	git_ios_register_embedded_child(cmd, thread);
+	return 1;
+}
+#endif
 
 static inline void close_pair(int fd[2])
 {
@@ -745,6 +989,21 @@ fail_pipe:
 	if (cmd->close_object_store)
 		odb_close(the_repository->objects);
 
+#ifdef GIT_IOS_EMBED
+	{
+		int embedded = git_ios_start_embedded_child(cmd, need_in, fdin, need_out, fdout, need_err, fderr);
+		if (embedded < 0) {
+			failed_errno = errno;
+			cmd->pid = -1;
+			if (!cmd->silent_exec_failure)
+				error_errno("cannot run %s", cmd->args.v[0]);
+			goto end_of_spawn;
+		}
+		if (embedded > 0)
+			goto end_of_spawn;
+	}
+#endif
+
 #ifndef GIT_WINDOWS_NATIVE
 {
 	int notify_pipe[2];
@@ -992,6 +1251,23 @@ end_of_spawn:
 
 int finish_command(struct child_process *cmd)
 {
+#ifdef GIT_IOS_EMBED
+	if (cmd->pid == git_ios_embedded_child_pid) {
+		struct git_ios_embedded_child *child = git_ios_take_embedded_child(cmd);
+		void *thread_result = NULL;
+		int ret;
+
+		if (!child)
+			BUG("missing embedded child state for %s", cmd->args.v[0]);
+		pthread_join(child->thread, &thread_result);
+		ret = (int)(intptr_t)thread_result;
+		trace2_child_exit(cmd, ret);
+		free(child);
+		child_process_clear(cmd);
+		invalidate_lstat_cache();
+		return ret;
+	}
+#endif
 	int ret = wait_or_whine(cmd->pid, cmd->args.v[0], 0);
 	trace2_child_exit(cmd, ret);
 	child_process_clear(cmd);
