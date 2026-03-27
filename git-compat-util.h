@@ -1036,7 +1036,12 @@ int cmd_main(int, const char **);
  * optionally emit a message before calling the real exit().
  */
 int common_exit(const char *file, int line, int code);
+#ifdef GIT_IOS_EMBED
+void NORETURN git_ios_exit(int code);
+#define exit(code) git_ios_exit(common_exit(__FILE__, __LINE__, (code)))
+#else
 #define exit(code) exit(common_exit(__FILE__, __LINE__, (code)))
+#endif
 
 /*
  * This include must come after system headers, since it introduces macros that

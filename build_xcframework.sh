@@ -81,7 +81,7 @@ build_slice() {
   mkdir -p "${include_dir}" "${out_dir}/git.framework" "${out_dir}/gitremote.framework"
   ln -s "${openssl_dir}/openssl.framework/Headers" "${include_dir}/openssl"
 
-  local developer_cflags="-I${include_dir} -I${CURL_INCLUDE_DIR}"
+  local developer_cflags="-I${include_dir} -I${CURL_INCLUDE_DIR} -DGIT_IOS_EMBED=1"
   local openssl_link="-F${openssl_dir} -framework openssl"
   local curl_link="-F${curl_dir} -framework curl_ios"
   local libssh2_link="-F${libssh2_dir} -framework libssh2"
@@ -106,14 +106,6 @@ build_slice() {
     "USE_LIBPCRE2="
   )
 
-  (
-    cd "${ROOT_DIR}"
-    make clean >/dev/null 2>&1 || true
-    make -j4 git git-remote-http "${make_vars[@]}"
-    eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} ${developer_cflags} -c git-wrapper.c -o git-wrapper.o
-    eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} ${developer_cflags} -c git-remote-http-wrapper.c -o git-remote-http-wrapper.o
-  )
-
   local make_dump
   make_dump="$(
     cd "${ROOT_DIR}"
@@ -126,6 +118,18 @@ build_slice() {
   lib_objs="$(dump_make_var "${make_dump}" "LIB_OBJS" | sed 's/ $(COMPAT_OBJS)//g')"
   builtin_objs="$(dump_make_var "${make_dump}" "BUILTIN_OBJS")"
   compat_objs="$(dump_make_var "${make_dump}" "COMPAT_OBJS")"
+  local -a build_targets
+  read -r -a build_targets <<< "${lib_objs} ${builtin_objs} ${compat_objs}"
+  build_targets+=(git.o remote-curl.o http.o http-walker.o)
+
+  (
+    cd "${ROOT_DIR}"
+    make clean >/dev/null 2>&1 || true
+    make -j4 "${make_vars[@]}" "${build_targets[@]}"
+    eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} ${developer_cflags} -c git-ios-exit.c -o git-ios-exit.o
+    eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} ${developer_cflags} -c git-wrapper.c -o git-wrapper.o
+    eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} ${developer_cflags} -c git-remote-http-wrapper.c -o git-remote-http-wrapper.o
+  )
 
   create_info_plist "${out_dir}/git.framework/Info.plist" "com.zats.git-ios.git" "git"
   create_info_plist "${out_dir}/gitremote.framework/Info.plist" "com.zats.git-ios.gitremote" "gitremote"
@@ -133,13 +137,13 @@ build_slice() {
   (
     cd "${ROOT_DIR}"
     eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} -dynamiclib \
-      ${lib_objs} ${builtin_objs} ${compat_objs} git-wrapper.o git.o \
+      ${lib_objs} ${builtin_objs} ${compat_objs} git-ios-exit.o git-wrapper.o git.o \
       -F "${openssl_dir}" -framework openssl -lz -liconv \
       -o "${out_dir}/git.framework/git" \
       -install_name @rpath/git.framework/git
 
     eval xcrun --sdk "${sdk}" clang -arch "${arch}" ${min_flag} -dynamiclib \
-      remote-curl.o http.o http-walker.o git-remote-http-wrapper.o \
+      remote-curl.o http.o http-walker.o git-ios-exit.o git-remote-http-wrapper.o \
       -F "${out_dir}" \
       -F "${out_dir}" -framework git \
       -F "${curl_dir}" -framework curl_ios \
